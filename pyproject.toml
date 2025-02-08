@@ -1,0 +1,15 @@
+[project]
+name = "tiny-gpt"
+version = "0.1.0"
+description = "Add your description here"
+readme = "README.md"
+requires-python = ">=3.12"
+dependencies = [
+    "accelerate>=1.3.0",
+    "datasets>=3.2.0",
+    "peft>=0.14.0",
+    "torch>=2.6.0",
+    "transformers>=4.48.3",
+    "trl>=0.14.0",
+    "wandb>=0.19.6",
+]
