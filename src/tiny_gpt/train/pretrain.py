@@ -13,11 +13,13 @@ from tiny_gpt.model.config import TinyGPTConfig
 from tiny_gpt.model.model import TinyGPTModel
 import logging
 import wandb
+import sys
+
 
 logger = logging.getLogger(__name__)
-logging.basicConfig(level=logging.INFO)
 
 torch.manual_seed(1337)
+np.random.seed(1337)
 
 dataset = "openwebtext"
 
@@ -57,21 +59,26 @@ def device_put(x, y):
 
 # helps estimate an arbitrarily accurate loss over either split using many batches
 @torch.inference_mode()
-def estimate_loss(model, loaders):
+def estimate_loss(
+    model,
+    loaders,
+    config: TinyGPTConfig,
+):
     model.eval()
     out = {}
     for split in loaders.keys():
         losses = torch.zeros(len(loaders[split]))
-        pbar = tqdm(
-            enumerate(loaders[split]),
-            desc=f"Evaluation {split}",
-            total=len(loaders[split]),
-        )
-        for step, (x, y) in pbar:
+        for step, (x, y) in enumerate(loaders[split]):
             x, y = device_put(x, y)
             with ctx:
                 _, loss = model(x, y)
             losses[step] = loss.item()
+
+            if (step + 1) % config.log_interval == 0:
+                logger.info(
+                    f"Evaluation [{split}] step: {step}, loss: {losses[:step+1].mean()}"
+                )
+
         out[split] = losses.mean()
     model.train()
     return out
@@ -82,24 +89,25 @@ best_val_loss = 1e9
 
 def train_epoch(
     model,
-    train_loader,
-    val_loader,
-    optimizer,
-    scheduler,
+    train_loader: DataLoader,
+    val_loader: DataLoader,
+    optimizer: torch.optim.Optimizer,
+    scheduler: torch.optim.lr_scheduler.LRScheduler,
     scaler,
-    epoch,
+    epoch: int,
     config: TinyGPTConfig,
 ):
+    global best_val_loss
+
     iter_per_epoch = len(train_loader)
     start_time = time.time()
     for step, (x, y) in enumerate(train_loader):
         global_step = epoch * iter_per_epoch + step
         # Evaluation
-        if (
-            global_step > config.warmup_steps
-            and global_step % config.eval_interval == 0
-        ):
-            losses = estimate_loss(model, {"train": train_loader, "val": val_loader})
+        if (global_step + 1) % config.eval_interval == 0:
+            losses = estimate_loss(
+                model, {"train": train_loader, "val": val_loader}, config
+            )
             log_data = {
                 "train/loss": losses["train"],
                 "val/loss": losses["val"],
@@ -109,19 +117,21 @@ def train_epoch(
 
             if losses["val"] < best_val_loss:
                 best_val_loss = losses["val"]
-                if epoch > 0:
-                    checkpoint = {
-                        "model": model.state_dict(),
-                        "optimizer": optimizer.state_dict(),
-                        "scheduler": scheduler.state_dict(),
-                        "scaler": scaler.state_dict(),
-                        "epoch": epoch,
-                        "step": global_step,
-                        "best_val_loss": best_val_loss,
-                        "config": config,
-                    }
-                    logger.info(f"Saving checkpoint to {config.out_dir}")
-                    torch.save(checkpoint, os.path.join(config.out_dir, "ckpt.pt"))
+                checkpoint = {
+                    "model": model.state_dict(),
+                    "optimizer": optimizer.state_dict(),
+                    "scheduler": scheduler.state_dict(),
+                    "scaler": scaler.state_dict(),
+                    "epoch": epoch,
+                    "step": global_step,
+                    "best_val_loss": best_val_loss,
+                    "config": config,
+                }
+                checkpoint_path = os.path.join(
+                    config.out_dir, f"pretrain_ckpt_{global_step}.pt"
+                )
+                logger.info(f"Saving checkpoint to {checkpoint_path}")
+                torch.save(checkpoint, checkpoint_path)
 
         # Training
         x, y = device_put(x, y)
@@ -153,7 +163,7 @@ def train_epoch(
 
         if step % config.log_interval == 0:
             spend_time = time.time() - start_time
-            word_counts = np.histogram(x, bins=50)
+            word_counts = np.histogram(torch.get_device(x), bins=50)
             log_data = {
                 "loss": loss.item() * config.accumulation_steps,
                 "lr": optimizer.param_groups[0]["lr"],
@@ -161,17 +171,25 @@ def train_epoch(
                 "word_distribution": wandb.Histogram(word_counts[0]),
             }
 
-            wandb.log(log_data, global_step)
-            for name, param in model.named_parameters():
-                wandb.log(
-                    {
-                        f"param_distribution/{name}": wandb.Histogram(
-                            param.data.cpu().numpy()
-                        )
-                    },
-                    global_step,
-                )
+            for param_name, param in model.named_parameters():
+                if param.requires_grad is None:
+                    continue
+                param_data = param.data.cpu().detach().numpy()
 
+                # Check for NaN values
+                if np.isnan(param_data).any():
+                    logger.warning(
+                        f"NaN detected in parameter {param_name} at step {global_step}"
+                    )
+                    continue
+
+                # Only log if we have valid finite values
+                if np.isfinite(param_data).any():
+                    log_data[f"param_distribution/{param_name}"] = wandb.Histogram(
+                        param_data
+                    )
+
+            wandb.log(log_data, global_step)
             logger.info(
                 "Epoch:[{}/{}]({}/{}) loss:{:.3f} lr:{:.7f} step_time:{}min:".format(
                     epoch,
@@ -188,10 +206,27 @@ def train_epoch(
 
 def main(xargs):
     config = TinyGPTConfig(**args)
+
+    # ensure the output dir is ready
+    os.makedirs(config.out_dir, exist_ok=True)
+
+    run_id = datetime.now().strftime("%Y%m%d_%H%M%S")
+
+    log_filename = f"pretrain_{run_id}.log"
+
+    # Configure logging
+    logging.basicConfig(
+        level=logging.DEBUG,  # Set the logging level
+        format="%(asctime)s - %(name)s - %(levelname)s - %(filename)s:%(lineno)d - %(message)s",  # Log format
+        handlers=[
+            logging.FileHandler(log_filename),  # Log to a file
+            logging.StreamHandler(sys.stdout),  # Print to the console
+        ],
+    )
     wandb.init(
         # set the wandb project where this run will be logged
         project=f"tiny-gpt-{device_type}",
-        name=f"run_{datetime.fromtimestamp(time.time()).strftime('%Y%m%d%H%M%S')}",
+        name=run_id,
         # track hyperparameters and run metadata
         config=config.to_dict(),
     )

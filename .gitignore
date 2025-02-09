@@ -13,3 +13,6 @@ data/*/*.bin
 wandb/*
 
 out
+*.log
+
+.DS_Store
