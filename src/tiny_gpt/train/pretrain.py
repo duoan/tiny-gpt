@@ -1,6 +1,7 @@
 import os
 import pickle
 import torch
+import numpy as np
 from torch.optim.lr_scheduler import ChainedScheduler, CosineAnnealingLR, LinearLR
 import time
 from tqdm import tqdm
@@ -132,8 +133,13 @@ def train_epoch(
 
         if (step + 1) % config.accumulation_steps == 0:
             scaler.unscale_(optimizer)
-            torch.nn.utils.clip_grad_norm_(
-                model.parameters(), config.clip_grad_max_norm
+            wandb.log(
+                {
+                    "grad_norm": torch.nn.utils.clip_grad_norm_(
+                        model.parameters(), config.clip_grad_max_norm
+                    )
+                },
+                global_step,
             )
 
             scaler.step(optimizer)
@@ -147,12 +153,25 @@ def train_epoch(
 
         if step % config.log_interval == 0:
             spend_time = time.time() - start_time
+            word_counts = np.histogram(x, bins=50)
             log_data = {
                 "loss": loss.item() * config.accumulation_steps,
                 "lr": optimizer.param_groups[0]["lr"],
                 "spend_time": spend_time,
+                "word_distribution": wandb.Histogram(word_counts[0]),
             }
+
             wandb.log(log_data, global_step)
+            for name, param in model.named_parameters():
+                wandb.log(
+                    {
+                        f"param_distribution/{name}": wandb.Histogram(
+                            param.data.cpu().numpy()
+                        )
+                    },
+                    global_step,
+                )
+
             logger.info(
                 "Epoch:[{}/{}]({}/{}) loss:{:.3f} lr:{:.7f} step_time:{}min:".format(
                     epoch,

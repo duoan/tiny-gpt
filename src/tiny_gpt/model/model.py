@@ -1,8 +1,10 @@
 import math
+from regex import D
 import torch
 import inspect
 import torch.nn.functional as F
 from torch import nn
+from transformers import PreTrainedModel
 from tiny_gpt.model.config import TinyGPTConfig
 import logging
 
@@ -104,10 +106,10 @@ class TransformerLayer(nn.Module):
         return x
 
 
-class TinyGPTModel(nn.Module):
+class TinyGPTModel(PreTrainedModel):
 
     def __init__(self, config: TinyGPTConfig = None):
-        super().__init__()
+        super().__init__(config)
         if config is None:
             config = TinyGPTConfig()
         self.config = config
