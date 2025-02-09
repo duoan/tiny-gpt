@@ -6,7 +6,7 @@ import time
 from tqdm import tqdm
 from datetime import datetime
 from contextlib import nullcontext
-from torch.utils.data import DataLoader
+from torch.utils.data import DataLoader, RandomSampler
 from tiny_gpt.model.dataset import PretrainDataset
 from tiny_gpt.model.config import TinyGPTConfig
 from tiny_gpt.model.model import TinyGPTModel
@@ -94,7 +94,10 @@ def train_epoch(
     for step, (x, y) in enumerate(train_loader):
         global_step = epoch * iter_per_epoch + step
         # Evaluation
-        if global_step % config.eval_interval == 0:
+        if (
+            global_step > config.warmup_steps
+            and global_step % config.eval_interval == 0
+        ):
             losses = estimate_loss(model, {"train": train_loader, "val": val_loader})
             log_data = {
                 "train/loss": losses["train"],
@@ -175,20 +178,9 @@ def main(xargs):
     )
 
     data_dir = os.path.join(xargs["data_dir"], dataset)
-    train_loader = DataLoader(
-        PretrainDataset(os.path.join(data_dir, "train.bin"), config),
-        config.batch_size,
-        shuffle=True,
-        pin_memory=True if device_type == "cuda" else False,
-        num_workers=config.num_workers,
-    )
-    val_loader = DataLoader(
-        PretrainDataset(os.path.join(data_dir, "val.bin"), config),
-        config.batch_size,
-        shuffle=False,
-        pin_memory=True if device_type == "cuda" else False,
-        num_workers=config.num_workers,
-    )
+
+    train_dataset = PretrainDataset(os.path.join(data_dir, "train.bin"), config)
+    val_dataset = PretrainDataset(os.path.join(data_dir, "val.bin"), config)
 
     meta_path = os.path.join(data_dir, "meta.pkl")
     meta_vocab_size = None
@@ -222,6 +214,30 @@ def main(xargs):
     scheduler = ChainedScheduler([warmup_scheduler, cosin_scheduler])
 
     for epoch in range(config.epochs):
+        # creat new dataloader each epoch, ensure the random sampler pick up differrent sets.
+        train_loader = DataLoader(
+            train_dataset,
+            config.batch_size,
+            pin_memory=True if device_type == "cuda" else False,
+            num_workers=config.num_workers,
+            sampler=RandomSampler(
+                train_dataset,
+                num_samples=int(len(train_dataset) * config.sample_rate),
+            ),
+        )
+        val_loader = DataLoader(
+            val_dataset,
+            config.batch_size,
+            pin_memory=True if device_type == "cuda" else False,
+            num_workers=config.num_workers,
+            sampler=RandomSampler(
+                val_dataset, num_samples=int(len(val_dataset) * config.sample_rate)
+            ),
+        )
+        logger.info(
+            f"TrainDataset: {len(train_dataset):,}, TrainDataloader: {len(train_loader):,} "
+            f"ValDataset: {len(val_dataset):,}, ValDataloader: {len(val_loader):,}"
+        )
         train_epoch(
             model,
             train_loader,

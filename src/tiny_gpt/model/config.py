@@ -10,6 +10,7 @@ class TinyGPTConfig(PretrainedConfig):
     model_type: str = "tiny_gpt"
     num_workers: int = 1
     epochs: int = 1
+    sample_rate: float = 0.001
     # adamw optimizer
     # max learning rate
     learning_rate: float = 6e-4
