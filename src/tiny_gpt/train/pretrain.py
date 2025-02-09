@@ -181,6 +181,30 @@ def main(xargs):
 
     train_dataset = PretrainDataset(os.path.join(data_dir, "train.bin"), config)
     val_dataset = PretrainDataset(os.path.join(data_dir, "val.bin"), config)
+    # creat new dataloader each epoch, ensure the random sampler pick up differrent sets.
+    train_loader = DataLoader(
+        train_dataset,
+        config.batch_size,
+        pin_memory=True if device_type == "cuda" else False,
+        num_workers=config.num_workers,
+        sampler=RandomSampler(
+            train_dataset,
+            num_samples=int(len(train_dataset) * config.sample_rate),
+        ),
+    )
+    val_loader = DataLoader(
+        val_dataset,
+        config.batch_size,
+        pin_memory=True if device_type == "cuda" else False,
+        num_workers=config.num_workers,
+        sampler=RandomSampler(
+            val_dataset, num_samples=int(len(val_dataset) * config.sample_rate)
+        ),
+    )
+    logger.info(
+        f"TrainDataset: {len(train_dataset):,}, TrainDataloader: {len(train_loader):,} "
+        f"ValDataset: {len(val_dataset):,}, ValDataloader: {len(val_loader):,}"
+    )
 
     meta_path = os.path.join(data_dir, "meta.pkl")
     meta_vocab_size = None
@@ -214,30 +238,6 @@ def main(xargs):
     scheduler = ChainedScheduler([warmup_scheduler, cosin_scheduler])
 
     for epoch in range(config.epochs):
-        # creat new dataloader each epoch, ensure the random sampler pick up differrent sets.
-        train_loader = DataLoader(
-            train_dataset,
-            config.batch_size,
-            pin_memory=True if device_type == "cuda" else False,
-            num_workers=config.num_workers,
-            sampler=RandomSampler(
-                train_dataset,
-                num_samples=int(len(train_dataset) * config.sample_rate),
-            ),
-        )
-        val_loader = DataLoader(
-            val_dataset,
-            config.batch_size,
-            pin_memory=True if device_type == "cuda" else False,
-            num_workers=config.num_workers,
-            sampler=RandomSampler(
-                val_dataset, num_samples=int(len(val_dataset) * config.sample_rate)
-            ),
-        )
-        logger.info(
-            f"TrainDataset: {len(train_dataset):,}, TrainDataloader: {len(train_loader):,} "
-            f"ValDataset: {len(val_dataset):,}, ValDataloader: {len(val_loader):,}"
-        )
         train_epoch(
             model,
             train_loader,
