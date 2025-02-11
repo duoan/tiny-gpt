@@ -1,9 +1,8 @@
 import math
-from regex import D
 import torch
 import inspect
 import torch.nn.functional as F
-from torch import nn
+from torch import Tensor, nn
 from transformers import PreTrainedModel
 from tiny_gpt.model.config import TinyGPTConfig
 import logging
@@ -11,7 +10,7 @@ import logging
 logger = logging.getLogger(__name__)
 
 
-class MultiHeadCausalAttention(nn.Module):
+class MultiHeadCausalSelfAttention(nn.Module):
     def __init__(self, config: TinyGPTConfig):
         super().__init__()
         assert config.n_embd % config.n_heads == 0
@@ -34,7 +33,7 @@ class MultiHeadCausalAttention(nn.Module):
                 torch.tril(torch.ones(seq_len, seq_len)).view(1, 1, seq_len, seq_len),
             )
 
-    def forward(self, x):
+    def forward(self, x: torch.Tensor):
         batch_size, seq_len, n_embd = x.size()
         q, k, v = self.c_attn(x).split(n_embd, dim=2)
         q = q.view(batch_size, seq_len, self.n_heads, self.head_dim).transpose(1, 2)
@@ -61,7 +60,7 @@ class MultiHeadCausalAttention(nn.Module):
         return self.c_proj(attn_output)
 
 
-class FeedWardNetwork(nn.Module):
+class FeedForwardNetwork(nn.Module):
     _activation_functions = {
         "relu": nn.ReLU(),
         "gelu": nn.GELU(),
@@ -87,7 +86,7 @@ def create_norm_layer(config):
     return (
         nn.LayerNorm(config.n_embd, bias=config.normalization_bias)
         if config.normalization == "layer"
-        else nn.RMSNorm(config.n_embd, bias=config.normalization_bias)
+        else nn.RMSNorm(config.n_embd)
     )
 
 
@@ -95,14 +94,15 @@ class TransformerLayer(nn.Module):
 
     def __init__(self, config: TinyGPTConfig):
         super().__init__()
-        self.ln_1 = create_norm_layer(config)
-        self.attn = MultiHeadCausalAttention(config)
-        self.ln_2 = create_norm_layer(config)
-        self.mlp = FeedWardNetwork(config)
+        self.norm_1 = create_norm_layer(config)
+        self.attn = MultiHeadCausalSelfAttention(config)
+        self.norm_2 = create_norm_layer(config)
+        self.ffn = FeedForwardNetwork(config)
 
     def forward(self, x):
-        x = x + self.attn(self.ln_1(x))
-        x = x + self.mlp(self.ln_2(x))
+        # We use the pre-normalization for better performance in attention and MLP
+        x = x + self.attn(self.norm_1(x))
+        x = x + self.ffn(self.norm_2(x))
         return x
 
 
@@ -145,7 +145,18 @@ class TinyGPTModel(PreTrainedModel):
         elif isinstance(module, nn.Embedding):
             torch.nn.init.normal_(module.weight, mean=0.0, std=0.02)
 
-    def forward(self, idx, targets=None):
+    def forward(self, idx: Tensor, targets: Tensor = None):
+        """Foward calculate the next token probobilities in the vocabs for the given tokens of the input sequence.
+
+        Args:
+            idx (Tensor): a batch of sequences' tokens. shape (batch_size, sequence_length)
+            targets (Tensor, optional): the ground truth next tokens for the batch sequences. shape (batch_size, 1)
+
+        Returns:
+            Tuple(Tensor, optional):
+                - the first element is the next token probobilities Tensor. Shape (batch_size, vocab_size)
+                - the second element is the loss, which meansure the gap with targets. Shape (batch_size, sequence_length)
+        """
         device = idx.device
         batch_size, seq_len = idx.size()
         assert (
