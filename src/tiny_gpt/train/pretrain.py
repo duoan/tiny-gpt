@@ -1,10 +1,8 @@
 import os
-import pickle
 import torch
 import numpy as np
 from torch.optim.lr_scheduler import ChainedScheduler, CosineAnnealingLR, LinearLR
 import time
-from tqdm import tqdm
 from datetime import datetime
 from contextlib import nullcontext
 from torch.utils.data import DataLoader, RandomSampler
@@ -61,27 +59,37 @@ def device_put(x, y):
 @torch.inference_mode()
 def estimate_loss(
     model,
-    loaders,
+    val_dataset,
     config: TinyGPTConfig,
 ):
     model.eval()
-    out = {}
-    for split in loaders.keys():
-        losses = torch.zeros(len(loaders[split]))
-        for step, (x, y) in enumerate(loaders[split]):
-            x, y = device_put(x, y)
-            with ctx:
-                _, loss = model(x, y)
-            losses[step] = loss.item()
 
-            if (step + 1) % config.log_interval == 0:
-                logger.info(
-                    f"Evaluation [{split}] step: {step}, loss: {losses[:step+1].mean()}"
-                )
+    val_loader = DataLoader(
+        val_dataset,
+        config.batch_size,
+        pin_memory=True if device_type == "cuda" else False,
+        num_workers=config.num_workers,
+        sampler=RandomSampler(
+            val_dataset, num_samples=int(len(val_dataset) * config.val_sample_rate)
+        ),
+    )
+    iter_steps = len(val_loader)
+    f"ValDataset: {len(val_dataset):,}, ValDataloader: {iter_steps:,}"
 
-        out[split] = losses.mean()
+    losses = torch.zeros(iter_steps)
+    for step, (x, y) in enumerate(val_loader):
+        x, y = device_put(x, y)
+        with ctx:
+            _, loss = model(x, y)
+        losses[step] = loss.item()
+
+        if (step + 1) % config.log_interval == 0:
+            logger.info(
+                f"Evaluation step: {step}/{iter_steps}, loss: {losses[:step+1].mean()}"
+            )
+
     model.train()
-    return out
+    return losses.mean().item()
 
 
 best_val_loss = 1e9
@@ -89,8 +97,8 @@ best_val_loss = 1e9
 
 def train_epoch(
     model,
-    train_loader: DataLoader,
-    val_loader: DataLoader,
+    train_dataset: PretrainDataset,
+    val_dataset: PretrainDataset,
     optimizer: torch.optim.Optimizer,
     scheduler: torch.optim.lr_scheduler.LRScheduler,
     scaler,
@@ -99,31 +107,43 @@ def train_epoch(
 ):
     global best_val_loss
 
+    # creat new dataloader each epoch, ensure the random sampler pick up differrent sets.
+    train_loader = DataLoader(
+        train_dataset,
+        config.batch_size,
+        pin_memory=True if device_type == "cuda" else False,
+        num_workers=config.num_workers,
+        sampler=RandomSampler(
+            train_dataset,
+            num_samples=int(len(train_dataset) * config.train_sample_rate),
+        ),
+    )
+
+    logger.info(
+        f"TrainDataset: {len(train_dataset):,}, TrainDataloader: {len(train_loader):,}"
+    )
+
     iter_per_epoch = len(train_loader)
-    start_time = time.time()
+
+    train_start_time = time.time()
+    train_epoch_losses = torch.zeros(iter_per_epoch)
     for step, (x, y) in enumerate(train_loader):
         global_step = epoch * iter_per_epoch + step
         # Evaluation
-        if (global_step + 1) % config.eval_interval == 0:
-            losses = estimate_loss(
-                model, {"train": train_loader, "val": val_loader}, config
-            )
-            log_data = {
-                "train/loss": losses["train"],
-                "val/loss": losses["val"],
-            }
-            logger.info(f"step: {global_step},{log_data}")
-            wandb.log(log_data, global_step)
-
-            if losses["val"] < best_val_loss:
-                best_val_loss = losses["val"]
+        eval_time_span = 0
+        if epoch > 0 and (global_step + 1) % config.eval_interval == 0:
+            eval_start_time = time.time()
+            val_loss = estimate_loss(model, val_dataset, config)
+            if val_loss < best_val_loss:
+                best_val_loss = val_loss
                 checkpoint = {
                     "model": model.state_dict(),
                     "optimizer": optimizer.state_dict(),
                     "scheduler": scheduler.state_dict(),
                     "scaler": scaler.state_dict(),
                     "epoch": epoch,
-                    "step": global_step,
+                    "epoch_step": step,
+                    "global_step": global_step,
                     "best_val_loss": best_val_loss,
                     "config": config,
                 }
@@ -133,14 +153,24 @@ def train_epoch(
                 logger.info(f"Saving checkpoint to {checkpoint_path}")
                 torch.save(checkpoint, checkpoint_path)
 
+            eval_time_span = time.time() - eval_start_time
+            log_data = {
+                "val/loss": val_loss,
+                "val/time": eval_time_span,
+            }
+            logger.info(f"Evaluation {global_step},{log_data}")
+            wandb.log(log_data, global_step)
+
         # Training
         x, y = device_put(x, y)
         with ctx:
-            logits, last_loss = model(x, y)
+            _, last_loss = model(x, y)
+            train_epoch_losses[step] = last_loss.item()
             loss = last_loss / config.accumulation_steps
 
         scaler.scale(loss).backward()
 
+        # Gradient accumulation
         if (step + 1) % config.accumulation_steps == 0:
             scaler.unscale_(optimizer)
             wandb.log(
@@ -162,13 +192,20 @@ def train_epoch(
             optimizer.zero_grad(set_to_none=True)
 
         if step % config.log_interval == 0:
-            spend_time = time.time() - start_time
+            train_step_time = (
+                time.time() - train_start_time + eval_time_span
+            ) / config.log_interval
+            train_grad_loss = loss.item() * config.accumulation_steps
+            train_mean_loss = train_epoch_losses[: step + 1].mean()
+            learning_rate = optimizer.param_groups[0]["lr"]
+
             word_counts = np.histogram(torch.get_device(x), bins=50)
             log_data = {
-                "loss": loss.item() * config.accumulation_steps,
-                "lr": optimizer.param_groups[0]["lr"],
-                "spend_time": spend_time,
-                "word_distribution": wandb.Histogram(word_counts[0]),
+                "train/grad_loss": train_grad_loss,
+                "train/mean_loss": train_mean_loss,
+                "train/lr": learning_rate,
+                "train/step_time": train_step_time,
+                "train/word_distribution": wandb.Histogram(word_counts[0]),
             }
 
             for param_name, param in model.named_parameters():
@@ -191,17 +228,18 @@ def train_epoch(
 
             wandb.log(log_data, global_step)
             logger.info(
-                "Epoch:[{}/{}]({}/{}) loss:{:.3f} lr:{:.7f} step_time:{}min:".format(
+                "Epoch:[{}/{}]({}/{}) train_losss grad:{:.3f} mean:{:.3f} lr:{:.7f} step_time:{:.4f} seconds".format(
                     epoch,
                     config.epochs,
                     step,
                     iter_per_epoch,
-                    loss.item() * config.accumulation_steps,
-                    optimizer.param_groups[0]["lr"],
-                    spend_time / (step + 1) * iter_per_epoch // 60 - spend_time // 60,
+                    train_grad_loss,
+                    train_mean_loss,
+                    learning_rate,
+                    train_step_time,
                 )
             )
-            start_time = time.time()
+            train_start_time = time.time()
 
 
 def main(xargs):
@@ -235,45 +273,17 @@ def main(xargs):
 
     train_dataset = PretrainDataset(os.path.join(data_dir, "train.bin"), config)
     val_dataset = PretrainDataset(os.path.join(data_dir, "val.bin"), config)
-    # creat new dataloader each epoch, ensure the random sampler pick up differrent sets.
-    train_loader = DataLoader(
-        train_dataset,
-        config.batch_size,
-        pin_memory=True if device_type == "cuda" else False,
-        num_workers=config.num_workers,
-        sampler=RandomSampler(
-            train_dataset,
-            num_samples=int(len(train_dataset) * config.sample_rate),
-        ),
-    )
-    val_loader = DataLoader(
-        val_dataset,
-        config.batch_size,
-        pin_memory=True if device_type == "cuda" else False,
-        num_workers=config.num_workers,
-        sampler=RandomSampler(
-            val_dataset, num_samples=int(len(val_dataset) * config.sample_rate)
-        ),
-    )
-    logger.info(
-        f"TrainDataset: {len(train_dataset):,}, TrainDataloader: {len(train_loader):,} "
-        f"ValDataset: {len(val_dataset):,}, ValDataloader: {len(val_loader):,}"
-    )
-
-    meta_path = os.path.join(data_dir, "meta.pkl")
-    meta_vocab_size = None
-    if os.path.exists(meta_path):
-        with open(meta_path, "rb") as f:
-            meta = pickle.load(f)
-        meta_vocab_size = meta["vocab_size"]
-        print(f"found vocab_size = {meta_vocab_size} (inside {meta_path})")
-        config.vocab_size = meta_vocab_size
 
     model = TinyGPTModel(config).to(device_type)
     if device_type == "cuda":
         model = torch.compile(model)
 
-    scaler = torch.amp.GradScaler(enabled=(config.dtype in ["float16", "bfloat16"]))
+    scaler = torch.amp.GradScaler(
+        enabled=(config.dtype in ["float16", "bfloat16"]),
+        init_scale=2**16,
+        growth_factor=1.5,
+        growth_interval=2000,
+    )
     optimizer = model.configure_optimizer(
         config.weight_decay,
         config.learning_rate,
@@ -285,7 +295,11 @@ def main(xargs):
         optimizer, start_factor=0.001, end_factor=1.0, total_iters=config.warmup_steps
     )
 
-    total_steps = len(train_loader) * config.epochs
+    total_steps = (
+        int(len(train_dataset) * config.train_sample_rate)
+        // config.batch_size
+        * config.epochs
+    )
     effective_steps = (total_steps - config.warmup_steps) // config.accumulation_steps
     cosin_scheduler = CosineAnnealingLR(optimizer, T_max=effective_steps, eta_min=0.001)
 
@@ -294,8 +308,8 @@ def main(xargs):
     for epoch in range(config.epochs):
         train_epoch(
             model,
-            train_loader,
-            val_loader,
+            train_dataset,
+            val_dataset,
             optimizer,
             scheduler,
             scaler,
