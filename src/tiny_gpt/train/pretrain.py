@@ -200,13 +200,25 @@ def train_epoch(
             train_mean_loss = train_epoch_losses[: step + 1].mean()
             learning_rate = optimizer.param_groups[0]["lr"]
             tokens_per_second = tokens_per_batch / train_step_time
-            word_counts = np.histogram(torch.get_device(x), bins=50)
+
+            logger.info(
+                "Epoch:[{}/{}]({}/{}) train_losss grad:{:.3f} mean:{:.3f} lr:{:.7f} step_time:{:.4f} seconds".format(
+                    epoch,
+                    config.epochs,
+                    step,
+                    iter_per_epoch,
+                    train_grad_loss,
+                    train_mean_loss,
+                    learning_rate,
+                    train_step_time,
+                )
+            )
+
             log_data = {
                 "train/grad_loss": train_grad_loss,
                 "train/mean_loss": train_mean_loss,
                 "train/lr": learning_rate,
                 "train/step_time": train_step_time,
-                "train/word_distribution": wandb.Histogram(word_counts[0]),
                 "perf/tokens_per_second": tokens_per_second,
             }
 
@@ -242,18 +254,7 @@ def train_epoch(
                 log_data[f"optimization/{param_name}_update_ratio"] = update_ratio
 
             wandb.log(log_data, global_step)
-            logger.info(
-                "Epoch:[{}/{}]({}/{}) train_losss grad:{:.3f} mean:{:.3f} lr:{:.7f} step_time:{:.4f} seconds".format(
-                    epoch,
-                    config.epochs,
-                    step,
-                    iter_per_epoch,
-                    train_grad_loss,
-                    train_mean_loss,
-                    learning_rate,
-                    train_step_time,
-                )
-            )
+
             train_start_time = time.time()
 
 
