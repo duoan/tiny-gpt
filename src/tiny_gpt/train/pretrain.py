@@ -127,6 +127,7 @@ def train_epoch(
 
     train_start_time = time.time()
     train_epoch_losses = torch.zeros(iter_per_epoch)
+    tokens_per_batch = config.batch_size * config.seq_len
     for step, (x, y) in enumerate(train_loader):
         global_step = epoch * iter_per_epoch + step
         # Evaluation
@@ -198,7 +199,7 @@ def train_epoch(
             train_grad_loss = loss.item() * config.accumulation_steps
             train_mean_loss = train_epoch_losses[: step + 1].mean()
             learning_rate = optimizer.param_groups[0]["lr"]
-
+            tokens_per_second = tokens_per_batch / train_step_time
             word_counts = np.histogram(torch.get_device(x), bins=50)
             log_data = {
                 "train/grad_loss": train_grad_loss,
@@ -206,6 +207,7 @@ def train_epoch(
                 "train/lr": learning_rate,
                 "train/step_time": train_step_time,
                 "train/word_distribution": wandb.Histogram(word_counts[0]),
+                "perf/tokens_per_second": tokens_per_second,
             }
 
             for param_name, param in model.named_parameters():
@@ -225,6 +227,19 @@ def train_epoch(
                     log_data[f"param_distribution/{param_name}"] = wandb.Histogram(
                         param_data
                     )
+
+                grad_norm = param.grad.norm().item()
+                param_norm = param.norm().item()
+                log_data[f"gradients/{param_name}_norm"] = grad_norm
+                log_data[f"gradients/{param_name}_weight_norm"] = param_norm
+                log_data[f"gradients/{param_name}_grad_to_weight_ratio"] = grad_norm / (
+                    param_norm + 1e-8
+                )
+
+                update_ratio = (
+                    learning_rate * param.grad.norm() / (param.norm() + 1e-8)
+                ).item()
+                log_data[f"optimization/{param_name}_update_ratio"] = update_ratio
 
             wandb.log(log_data, global_step)
             logger.info(
@@ -277,6 +292,8 @@ def main(xargs):
     model = TinyGPTModel(config).to(device_type)
     if device_type == "cuda":
         model = torch.compile(model)
+
+    wandb.log({"model/total_parameters": model.count_parameters()})
 
     scaler = torch.amp.GradScaler(
         enabled=(config.dtype in ["float16", "bfloat16"]),
