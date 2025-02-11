@@ -100,7 +100,7 @@ class TransformerLayer(nn.Module):
         self.ffn = FeedForwardNetwork(config)
 
     def forward(self, x):
-        # We use the pre-normalization for better performance in attention and MLP
+        # We use the pre-normalization for stable training
         x = x + self.attn(self.norm_1(x))
         x = x + self.ffn(self.norm_2(x))
         return x
@@ -236,6 +236,9 @@ class TinyGPTModel(PreTrainedModel):
 
         if not stream:
             yield idx[:, index:]
+
+    def count_parameters(self):
+        return sum(p.numel() for p in self.parameters() if p.requires_grad)
 
     def configure_optimizer(self, weight_decay, learning_rate, betas, device_type):
         # start with all of the candidate parameters
