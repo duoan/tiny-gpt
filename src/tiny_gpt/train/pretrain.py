@@ -96,12 +96,12 @@ best_val_loss = 1e9
 
 
 def train_epoch(
-    model,
+    model: torch.nn.Module,
     train_dataset: PretrainDataset,
     val_dataset: PretrainDataset,
     optimizer: torch.optim.Optimizer,
     scheduler: torch.optim.lr_scheduler.LRScheduler,
-    scaler,
+    scaler: torch.amp.GradScaler,
     epoch: int,
     config: TinyGPTConfig,
 ):
@@ -271,12 +271,13 @@ def train_epoch(
 
 
 def main(xargs):
+    run_id = datetime.now().strftime("%Y%m%d_%H%M%S")
+
     config = TinyGPTConfig(**args)
+    config.out_dir = os.path.join(config.out_dir, run_id)
 
     # ensure the output dir is ready
     os.makedirs(config.out_dir, exist_ok=True)
-
-    run_id = datetime.now().strftime("%Y%m%d_%H%M%S")
 
     log_filename = f"pretrain_{run_id}.log"
 
