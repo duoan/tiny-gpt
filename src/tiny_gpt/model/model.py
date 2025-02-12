@@ -34,6 +34,13 @@ class MultiHeadCausalSelfAttention(nn.Module):
             )
 
     def forward(self, x: torch.Tensor):
+        """
+        Args:
+            x (torch.Tensor): shape (batch_size, seq_len, n_embd)
+
+        Returns:
+            torch.Tensor: shape (batch_size, seq_len, embd) of tensor with multi-head attention output.
+        """
         batch_size, seq_len, n_embd = x.size()
         q, k, v = self.c_attn(x).split(n_embd, dim=2)
         q = q.view(batch_size, seq_len, self.n_heads, self.head_dim).transpose(1, 2)
@@ -41,23 +48,29 @@ class MultiHeadCausalSelfAttention(nn.Module):
         v = v.view(batch_size, seq_len, self.n_heads, self.head_dim).transpose(1, 2)
 
         if self.is_fast:
-            attn_output = F.scaled_dot_product_attention(
+            attn_weights = F.scaled_dot_product_attention(
                 q, k, v, is_causal=True, dropout_p=self.dropout_p
             )
         else:
             scale_factor = 1 / math.sqrt(q.size(-1))
+            attn_scores = torch.matmul(q, k.transpose(-2, -1)) * scale_factor
+            # add mask for causal
+            # prediction to prevent current token know the next tokens information [data leak]
             attention_mask = self.tril[:seq_len, :seq_len]
-            attn_weight = torch.matmul(q, k.transpose(-2, -1)) * scale_factor
-            attn_weight = attn_weight.masked_fill(attention_mask == 0, -9e15)
-            attn_weight = F.softmax(attn_weight, dim=-1)
-            attn_weight = torch.dropout(attn_weight, self.dropout_p, train=True)
-            attn_output = torch.matmul(attn_weight, v)
+            attn_scores = attn_scores.masked_fill(attention_mask == 0, -9e15)
+            # Normalizing the attention score at token level
+            attn_probs = F.softmax(attn_scores, dim=-1)
+            # Dropout to prevent overfitting
+            attn_probs = torch.dropout(attn_probs, self.dropout_p, train=True)
+            # Apply the attention probs on the values
+            attn_weights = torch.matmul(attn_probs, v)
 
-        attn_output = (
-            attn_output.transpose(1, 2).contiguous().view(batch_size, seq_len, n_embd)
+        attn_weights = (
+            attn_weights.transpose(1, 2).contiguous().view(batch_size, seq_len, n_embd)
         )
 
-        return self.c_proj(attn_output)
+        attn_outputs = self.c_proj(attn_weights)
+        return attn_outputs
 
 
 class FeedForwardNetwork(nn.Module):
@@ -240,7 +253,7 @@ class TinyGPTModel(PreTrainedModel):
     def count_parameters(self):
         return sum(p.numel() for p in self.parameters() if p.requires_grad)
 
-    def configure_optimizer(self, weight_decay, learning_rate, betas, device_type):
+    def configure_optimizer(self, device_type):
         # start with all of the candidate parameters
         param_dict = {pn: p for pn, p in self.named_parameters()}
         # filter out those that do not require grad
@@ -250,7 +263,7 @@ class TinyGPTModel(PreTrainedModel):
         decay_params = [p for _, p in param_dict.items() if p.dim() >= 2]
         nodecay_params = [p for _, p in param_dict.items() if p.dim() < 2]
         optim_groups = [
-            {"params": decay_params, "weight_decay": weight_decay},
+            {"params": decay_params, "weight_decay": self.config.adamw_weight_decay},
             {"params": nodecay_params, "weight_decay": 0.0},
         ]
         num_decay_params = sum(p.numel() for p in decay_params)
@@ -266,7 +279,11 @@ class TinyGPTModel(PreTrainedModel):
         use_fused = fused_available and device_type == "cuda"
         extra_args = dict(fused=True) if use_fused else dict()
         optimizer = torch.optim.AdamW(
-            optim_groups, lr=learning_rate, betas=betas, **extra_args
+            optim_groups,
+            lr=self.config.learning_rate,
+            betas=(self.config.adamw_beta1, self.config.adamw_beta2),
+            eps=self.config.adamw_eps,
+            **extra_args,
         )
         logger.info(f"using fused AdamW: {use_fused}")
 
