@@ -129,10 +129,10 @@ def train_epoch(
     train_epoch_losses = torch.zeros(iter_per_epoch)
     tokens_per_batch = config.batch_size * config.seq_len
     for step, (x, y) in enumerate(train_loader):
-        global_step = epoch * iter_per_epoch + step
+        global_step = epoch * iter_per_epoch + step + 1
         # Evaluation
         eval_time_span = 0
-        if epoch > 0 and (global_step + 1) % config.eval_interval == 0:
+        if epoch > 0 and global_step % config.eval_interval == 0:
             eval_start_time = time.time()
             val_loss = estimate_loss(model, val_dataset, config)
             if val_loss < best_val_loss:
@@ -192,7 +192,7 @@ def train_epoch(
             # flush the gradients as soon as we can, no need for this memory anymore
             optimizer.zero_grad(set_to_none=True)
 
-        if step % config.log_interval == 0:
+        if (1 + step) % config.log_interval == 0:
             train_step_time = (
                 time.time() - train_start_time + eval_time_span
             ) / config.log_interval
@@ -203,9 +203,9 @@ def train_epoch(
 
             logger.info(
                 "Epoch:[{}/{}]({}/{}) train_losss grad:{:.3f} mean:{:.3f} lr:{:.7f} step_time:{:.4f} seconds".format(
-                    epoch,
+                    epoch + 1,
                     config.epochs,
-                    step,
+                    step + 1,
                     iter_per_epoch,
                     train_grad_loss,
                     train_mean_loss,
@@ -236,22 +236,34 @@ def train_epoch(
 
                 # Only log if we have valid finite values
                 if np.isfinite(param_data).any():
-                    log_data[f"param_distribution/{param_name}"] = wandb.Histogram(
-                        param_data
+                    try:
+                        # Use fewer bins and handle small ranges
+                        num_bins = min(
+                            64, int(np.sqrt(param_data.size))
+                        )  # Reduce number of bins
+                        hist = wandb.Histogram(param_data, num_bins=num_bins)
+                        log_data[f"param_distribution/{param_name}"] = hist
+                    except ValueError as e:
+                        # If histogram creation fails, log basic statistics instead
+                        log_data[f"param_stats/{param_name}/mean"] = np.mean(param_data)
+                        log_data[f"param_stats/{param_name}/std"] = np.std(param_data)
+                        log_data[f"param_stats/{param_name}/min"] = np.min(param_data)
+                        log_data[f"param_stats/{param_name}/max"] = np.max(param_data)
+                        logger.warning(
+                            f"Failed to create histogram for {param_name}: {str(e)}"
+                        )
+
+                if param.grad is not None:
+                    grad_norm = param.grad.norm().item()
+                    param_norm = param.norm().item()
+                    log_data[f"gradients/{param_name}_norm"] = grad_norm
+                    log_data[f"gradients/{param_name}_weight_norm"] = param_norm
+                    grad_to_weight_ratio = grad_norm / (param_norm + 1e-8)
+                    log_data[f"gradients/{param_name}_grad_to_weight_ratio"] = (
+                        grad_to_weight_ratio
                     )
-
-                grad_norm = param.grad.norm().item()
-                param_norm = param.norm().item()
-                log_data[f"gradients/{param_name}_norm"] = grad_norm
-                log_data[f"gradients/{param_name}_weight_norm"] = param_norm
-                log_data[f"gradients/{param_name}_grad_to_weight_ratio"] = grad_norm / (
-                    param_norm + 1e-8
-                )
-
-                update_ratio = (
-                    learning_rate * param.grad.norm() / (param.norm() + 1e-8)
-                ).item()
-                log_data[f"optimization/{param_name}_update_ratio"] = update_ratio
+                    update_ratio = learning_rate * grad_to_weight_ratio
+                    log_data[f"optim/{param_name}_update_ratio"] = update_ratio
 
             wandb.log(log_data, global_step)
 
@@ -298,9 +310,10 @@ def main(xargs):
 
     scaler = torch.amp.GradScaler(
         enabled=(config.dtype in ["float16", "bfloat16"]),
-        init_scale=2**16,
-        growth_factor=1.5,
-        growth_interval=2000,
+        init_scale=2**14,
+        growth_factor=1.2,
+        growth_interval=4000,
+        backoff_factor=0.5,
     )
     optimizer = model.configure_optimizer(
         config.weight_decay,
@@ -310,7 +323,7 @@ def main(xargs):
     )
 
     warmup_scheduler = LinearLR(
-        optimizer, start_factor=0.001, end_factor=1.0, total_iters=config.warmup_steps
+        optimizer, start_factor=0.0001, end_factor=0.3, total_iters=config.warmup_steps
     )
 
     total_steps = (
@@ -319,7 +332,7 @@ def main(xargs):
         * config.epochs
     )
     effective_steps = (total_steps - config.warmup_steps) // config.accumulation_steps
-    cosin_scheduler = CosineAnnealingLR(optimizer, T_max=effective_steps, eta_min=0.001)
+    cosin_scheduler = CosineAnnealingLR(optimizer, T_max=effective_steps, eta_min=1e-5)
 
     scheduler = ChainedScheduler([warmup_scheduler, cosin_scheduler])
 

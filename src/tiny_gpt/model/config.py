@@ -14,18 +14,17 @@ class TinyGPTConfig(PretrainedConfig):
     val_sample_rate: float = 0.001
     # adamw optimizer
     # max learning rate
-    learning_rate: float = 6e-4
-    weight_decay: float = 1e-1
+    learning_rate: float = 3e-4
+    weight_decay: float = 1e-2
     beta1: float = 0.9
     beta2: float = 0.95
-    warmup_steps: int = 2000
+    warmup_steps: int = 4000
     ############################
-    accumulation_steps: int = 10
+    accumulation_steps: int = 16
     # clip gradients at this value, or disable if == 0.0
-    clip_grad_max_norm: float = 1
-    log_interval: int = 100
+    clip_grad_max_norm: float = 0.5
+    log_interval: int = 200
     eval_interval: int = 2000
-    checkpoint_interval: int = 100
     dtype: str = "float32"
     vocab_size: int = n_vocab
     batch_size: int = 16
@@ -45,15 +44,15 @@ class TinyGPTConfig(PretrainedConfig):
     position_enc: str = "learnable"
 
     attention_is_fast: bool = True
-    attention_dropout_p: float = 0.1
+    attention_dropout_p: float = 0.05
 
-    ffn_dropout_p: float = 0.1
+    ffn_dropout_p: float = 0.05
     ffn_activation_fn: str = "gelu"
     # support layer norm and RMS norm
     normalization: str = "layer"
     normalization_bias: bool = True
 
-    embd_dropout_p: float = 0.1
+    embd_dropout_p: float = 0.05
 
     out_dir: str = "out"
 
